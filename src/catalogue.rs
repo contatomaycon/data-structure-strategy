@@ -37,8 +37,8 @@ impl Catalogue {
         v
     }
 
-    pub fn recommend(&self, id: ProductId, k: usize) -> Vec<Product> {
-        let ids = self.graph.recommend(id, k);
+    pub fn recommend(&self, id: ProductId, depth: usize, k: usize) -> Vec<Product> {
+        let ids = self.graph.recommend(id, depth, k);
         let mut v: Vec<Product> = Vec::new();
         for pid in ids {
             if let Some(p) = self.products.get(&pid) { v.push(p.clone()); }

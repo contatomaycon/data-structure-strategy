@@ -1,61 +1,193 @@
-use petgraph::visit::EdgeRef;
-use petgraph::graph::{DiGraph, NodeIndex};
-use std::collections::HashMap;
+use petgraph::graph::{NodeIndex, UnGraph};
+use std::collections::{HashMap, HashSet, VecDeque};
+
 use crate::models::{Product, ProductId};
 use crate::normalizer::normalize_token;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum GraphNode {
+    Product(ProductId),
+    Feature(String),
+}
+
 pub struct ProductGraph {
-    g: DiGraph<ProductId, f32>,
-    idx_by_id: HashMap<ProductId, NodeIndex>,
+    g: UnGraph<GraphNode, ()>,
+    idx_by_product_id: HashMap<ProductId, NodeIndex>,
+    idx_by_feature: HashMap<String, NodeIndex>,
 }
 
 impl ProductGraph {
-    pub fn new() -> Self { Self { g: DiGraph::new(), idx_by_id: HashMap::new() } }
+    pub fn new() -> Self {
+        Self {
+            g: UnGraph::new_undirected(),
+            idx_by_product_id: HashMap::new(),
+            idx_by_feature: HashMap::new(),
+        }
+    }
 
     pub fn build(&mut self, products: &[Product]) {
-        self.g = DiGraph::new();
-        self.idx_by_id.clear();
+        self.g = UnGraph::new_undirected();
+        self.idx_by_product_id.clear();
+        self.idx_by_feature.clear();
+
         for p in products {
-            let idx = self.g.add_node(p.id);
-            self.idx_by_id.insert(p.id, idx);
+            let idx = self.g.add_node(GraphNode::Product(p.id));
+            self.idx_by_product_id.insert(p.id, idx);
         }
-        for i in 0..products.len() {
-            for j in i+1..products.len() {
-                let a = &products[i];
-                let b = &products[j];
-                let w = self.weight(a,b);
-                if w > 0.0 {
-                    let ia = self.idx_by_id[&a.id];
-                    let ib = self.idx_by_id[&b.id];
-                    self.g.add_edge(ia, ib, w);
-                    self.g.add_edge(ib, ia, w);
+
+        for p in products {
+            let product_idx = self.idx_by_product_id[&p.id];
+            let mut features: HashSet<String> = HashSet::new();
+
+            let category = normalize_token(&p.category);
+            if !category.is_empty() {
+                features.insert(format!("cat:{category}"));
+            }
+
+            let brand = normalize_token(&p.brand);
+            if !brand.is_empty() {
+                features.insert(format!("brand:{brand}"));
+            }
+
+            for tag in &p.tags {
+                let normalized = normalize_token(tag);
+                if !normalized.is_empty() {
+                    features.insert(format!("tag:{normalized}"));
+                }
+            }
+
+            for feature_key in features {
+                self.connect_product_feature(product_idx, feature_key);
+            }
+        }
+    }
+
+    pub fn recommend(&self, id: ProductId, depth: usize, k: usize) -> Vec<ProductId> {
+        if depth == 0 || k == 0 {
+            return Vec::new();
+        }
+
+        let Some(&start_idx) = self.idx_by_product_id.get(&id) else {
+            return Vec::new();
+        };
+
+        let max_hops = depth.saturating_mul(2);
+        let direct_overlap = self.direct_feature_overlap(start_idx, id);
+
+        let mut queue: VecDeque<(NodeIndex, usize)> = VecDeque::new();
+        let mut visited_hops: HashMap<NodeIndex, usize> = HashMap::new();
+        let mut product_distance: HashMap<ProductId, usize> = HashMap::new();
+
+        queue.push_back((start_idx, 0));
+        visited_hops.insert(start_idx, 0);
+
+        while let Some((node_idx, hops)) = queue.pop_front() {
+            if hops >= max_hops {
+                continue;
+            }
+
+            for neighbor in self.g.neighbors(node_idx) {
+                let next_hops = hops + 1;
+                let should_visit = match visited_hops.get(&neighbor) {
+                    Some(prev_hops) => next_hops < *prev_hops,
+                    None => true,
+                };
+
+                if should_visit {
+                    visited_hops.insert(neighbor, next_hops);
+                    queue.push_back((neighbor, next_hops));
+                }
+
+                if next_hops % 2 == 0 {
+                    if let Some(GraphNode::Product(pid)) = self.g.node_weight(neighbor) {
+                        if *pid != id {
+                            let d = next_hops / 2;
+                            product_distance
+                                .entry(*pid)
+                                .and_modify(|best| {
+                                    if d < *best {
+                                        *best = d;
+                                    }
+                                })
+                                .or_insert(d);
+                        }
+                    }
                 }
             }
         }
+
+        let mut ranked: Vec<(ProductId, usize, usize)> = product_distance
+            .into_iter()
+            .map(|(pid, distance)| {
+                let overlap = *direct_overlap.get(&pid).unwrap_or(&0);
+                (pid, distance, overlap)
+            })
+            .collect();
+
+        ranked.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| b.2.cmp(&a.2)).then_with(|| a.0.cmp(&b.0)));
+
+        ranked.into_iter().take(k).map(|(pid, _, _)| pid).collect()
     }
 
-    fn weight(&self, a: &Product, b: &Product) -> f32 {
-        let ca = normalize_token(&a.category);
-        let cb = normalize_token(&b.category);
-        let mut w = 0.0;
-        if ca == cb { w += 2.0; }
-        let sa: std::collections::HashSet<_> = a.tags.iter().map(|t| normalize_token(t)).collect();
-        let sb: std::collections::HashSet<_> = b.tags.iter().map(|t| normalize_token(t)).collect();
-        let inter = sa.intersection(&sb).count();
-        if inter > 0 { w += inter as f32; }
-        w
+    fn connect_product_feature(&mut self, product_idx: NodeIndex, feature_key: String) {
+        let feature_idx = if let Some(&idx) = self.idx_by_feature.get(&feature_key) {
+            idx
+        } else {
+            let idx = self.g.add_node(GraphNode::Feature(feature_key.clone()));
+            self.idx_by_feature.insert(feature_key, idx);
+            idx
+        };
+
+        self.g.add_edge(product_idx, feature_idx, ());
     }
 
-    pub fn recommend(&self, id: ProductId, k: usize) -> Vec<ProductId> {
-        let mut out: Vec<(ProductId,f32)> = Vec::new();
-        if let Some(&idx) = self.idx_by_id.get(&id) {
-            for e in self.g.edges(idx) {
-                out.push((*self.g.node_weight(e.target()).unwrap(), *e.weight()));
+    fn direct_feature_overlap(&self, start_idx: NodeIndex, source_id: ProductId) -> HashMap<ProductId, usize> {
+        let mut overlap: HashMap<ProductId, usize> = HashMap::new();
+
+        for feature_idx in self.g.neighbors(start_idx) {
+            for product_idx in self.g.neighbors(feature_idx) {
+                if let Some(GraphNode::Product(pid)) = self.g.node_weight(product_idx) {
+                    if *pid != source_id {
+                        *overlap.entry(*pid).or_insert(0) += 1;
+                    }
+                }
             }
-            out.sort_by(|a,b| b.1.partial_cmp(&a.1).unwrap());
-            out.truncate(k);
-            return out.into_iter().map(|(id,_)| id).collect();
         }
-        Vec::new()
+
+        overlap
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(id: usize, name: &str, brand: &str, category: &str, tags: &[&str]) -> Product {
+        Product {
+            id,
+            name: name.into(),
+            brand: brand.into(),
+            category: category.into(),
+            tags: tags.iter().map(|t| (*t).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn recommend_respects_depth() {
+        let products = vec![
+            p(1, "Alpha", "A", "Cat1", &["x"]),
+            p(2, "Beta", "B", "Cat2", &["x", "y"]),
+            p(3, "Gamma", "C", "Cat3", &["y"]),
+        ];
+
+        let mut graph = ProductGraph::new();
+        graph.build(&products);
+
+        let d1 = graph.recommend(1, 1, 10);
+        assert!(d1.contains(&2));
+        assert!(!d1.contains(&3));
+
+        let d2 = graph.recommend(1, 2, 10);
+        assert!(d2.contains(&3));
     }
 }

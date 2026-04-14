@@ -6,6 +6,8 @@ pub type ProductId = usize;
 pub struct Product {
     pub id: ProductId,
     pub name: String,
+    #[serde(default)]
+    pub brand: String,
     pub category: String,
     pub tags: Vec<String>,
 }

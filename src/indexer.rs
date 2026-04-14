@@ -5,6 +5,7 @@ use crate::normalizer::{tokenize, normalize_token};
 #[derive(Default)]
 pub struct SearchIndex {
     pub by_name: HashMap<String, Vec<ProductId>>,
+    pub by_brand: HashMap<String, Vec<ProductId>>,
     pub by_category: HashMap<String, Vec<ProductId>>,
     pub by_tag: HashMap<String, Vec<ProductId>>,
 }
@@ -16,6 +17,10 @@ impl SearchIndex {
         for t in tokenize(&p.name) {
             self.by_name.entry(t).or_default().push(p.id);
         }
+        let b = normalize_token(&p.brand);
+        if !b.is_empty() {
+            self.by_brand.entry(b).or_default().push(p.id);
+        }
         let c = normalize_token(&p.category);
         self.by_category.entry(c).or_default().push(p.id);
         for tag in &p.tags {
@@ -26,6 +31,7 @@ impl SearchIndex {
 
     pub fn finalize(&mut self) {
         for v in self.by_name.values_mut() { v.sort_unstable(); v.dedup(); }
+        for v in self.by_brand.values_mut() { v.sort_unstable(); v.dedup(); }
         for v in self.by_category.values_mut() { v.sort_unstable(); v.dedup(); }
         for v in self.by_tag.values_mut() { v.sort_unstable(); v.dedup(); }
     }
